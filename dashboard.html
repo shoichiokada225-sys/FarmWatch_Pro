@@ -1010,6 +1010,94 @@ function deleteFarmData(farmId) {
   });
 }
 
+/* ===== CLOUD SYNC (File System Access API) ===== */
+const CloudSync = (() => {
+  let _dirHandle = null;
+  const SYNC_FILE = 'farmwatch-sync.json';
+  const DB_KEY = 'farmwatch-sync-dir';
+
+  function isSupported() {
+    return typeof window.showDirectoryPicker === 'function';
+  }
+
+  async function pickFolder() {
+    try {
+      _dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function verifyPermission() {
+    if (!_dirHandle) return false;
+    try {
+      const opts = { mode: 'readwrite' };
+      if ((await _dirHandle.queryPermission(opts)) === 'granted') return true;
+      if ((await _dirHandle.requestPermission(opts)) === 'granted') return true;
+    } catch {}
+    return false;
+  }
+
+  function collectAllData() {
+    const data = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('farmwatch-')) {
+        data[key] = localStorage.getItem(key);
+      }
+    }
+    data['_syncTimestamp'] = new Date().toISOString();
+    data['_version'] = VERSION;
+    return data;
+  }
+
+  function restoreAllData(data) {
+    let count = 0;
+    Object.keys(data).forEach(key => {
+      if (key.startsWith('farmwatch-') && typeof data[key] === 'string') {
+        localStorage.setItem(key, data[key]);
+        count++;
+      }
+    });
+    return count;
+  }
+
+  async function saveToFile() {
+    if (!_dirHandle || !(await verifyPermission())) return { ok: false, reason: 'no-permission' };
+    try {
+      const fileHandle = await _dirHandle.getFileHandle(SYNC_FILE, { create: true });
+      const writable = await fileHandle.createWritable();
+      await writable.write(JSON.stringify(collectAllData(), null, 2));
+      await writable.close();
+      localStorage.setItem('farmwatch-last-sync', new Date().toISOString());
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: e.message };
+    }
+  }
+
+  async function loadFromFile() {
+    if (!_dirHandle || !(await verifyPermission())) return { ok: false, reason: 'no-permission' };
+    try {
+      const fileHandle = await _dirHandle.getFileHandle(SYNC_FILE);
+      const file = await fileHandle.getFile();
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const count = restoreAllData(data);
+      return { ok: true, count, timestamp: data['_syncTimestamp'] };
+    } catch (e) {
+      if (e.name === 'NotFoundError') return { ok: false, reason: 'no-file' };
+      return { ok: false, reason: e.message };
+    }
+  }
+
+  function isConnected() { return !!_dirHandle; }
+  function getLastSync() { return localStorage.getItem('farmwatch-last-sync'); }
+
+  return { isSupported, pickFolder, verifyPermission, saveToFile, loadFromFile, isConnected, getLastSync, collectAllData };
+})();
+
 /* ===== CSV PARSER ===== */
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
@@ -1960,6 +2048,59 @@ function FarmDashboard({
     reader.readAsText(file);
     e.target.value = '';
   };
+  /* ===== Cloud Sync Handlers ===== */
+  const [syncConnected, setSyncConnected] = useState(false);
+  const handleCloudConnect = async () => {
+    if (!CloudSync.isSupported()) {
+      toast('このブラウザはクラウド同期に対応していません。Chrome/Edgeをお使いください。', 'error');
+      return;
+    }
+    const ok = await CloudSync.pickFolder();
+    if (ok) {
+      setSyncConnected(true);
+      toast('同期フォルダを接続しました。OneDriveフォルダを選択した場合、他のPCと自動同期されます。', 'success');
+    }
+  };
+  const handleCloudSave = async () => {
+    if (!CloudSync.isConnected()) {
+      await handleCloudConnect();
+      if (!CloudSync.isConnected()) return;
+    }
+    const result = await CloudSync.saveToFile();
+    if (result.ok) {
+      toast('クラウド同期: データを保存しました', 'success');
+    } else {
+      toast('クラウド同期: 保存に失敗しました - ' + result.reason, 'error');
+    }
+  };
+  const handleCloudLoad = async () => {
+    if (!CloudSync.isConnected()) {
+      await handleCloudConnect();
+      if (!CloudSync.isConnected()) return;
+    }
+    const result = await CloudSync.loadFromFile();
+    if (result.ok) {
+      toast(`クラウド同期: ${result.count}件のデータを復元しました (${result.timestamp})`, 'success');
+      window.location.reload();
+    } else if (result.reason === 'no-file') {
+      toast('同期ファイルが見つかりません。先に「クラウドに保存」を実行してください。', 'info');
+    } else {
+      toast('クラウド同期: 読み込みに失敗しました - ' + result.reason, 'error');
+    }
+  };
+  /* Auto-save on data change */
+  const syncTimerRef = useRef(null);
+  useEffect(() => {
+    if (!syncConnected) return;
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => {
+      CloudSync.saveToFile().then(r => {
+        if (r.ok) console.log('[CloudSync] auto-saved');
+      });
+    }, 3000);
+    return () => { if (syncTimerRef.current) clearTimeout(syncTimerRef.current); };
+  }, [daily, monthlyPrev, monthlyCur, initiatives, breeding, areas, farmName, target, alertThreshold, syncConnected]);
+
   const updateFarmName = name => {
     setFarmName(name);
     const fl = loadFarmList().map(f => f.id === farmId ? {
@@ -2460,6 +2601,10 @@ function FarmDashboard({
     onExport: handleExportAll,
     onExcelExport: handleExcelExport,
     onImportAll: handleImportAll,
+    onCloudConnect: handleCloudConnect,
+    onCloudSave: handleCloudSave,
+    onCloudLoad: handleCloudLoad,
+    syncConnected: syncConnected,
     onShowTour: () => {
       setShowSettings(false);
       setShowHelpTour(true);
@@ -2949,6 +3094,10 @@ function SettingsPanel({
   onExport,
   onExcelExport,
   onImportAll,
+  onCloudConnect,
+  onCloudSave,
+  onCloudLoad,
+  syncConnected,
   onShowTour,
   target,
   setTarget,
@@ -3078,7 +3227,31 @@ function SettingsPanel({
   })), /*#__PURE__*/React.createElement("button", {
     onClick: onReset,
     className: "px-4 py-2 bg-[#e11d48] text-white rounded-lg text-sm hover:bg-[#e11d48]"
-  }, "\u30C7\u30FC\u30BF\u30EA\u30BB\u30C3\u30C8")), /*#__PURE__*/React.createElement("div", {
+  }, "\u30C7\u30FC\u30BF\u30EA\u30BB\u30C3\u30C8")), CloudSync.isSupported() && /*#__PURE__*/React.createElement("div", {
+    className: "border-t pt-4 space-y-2"
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "text-sm font-medium text-[#020617] block"
+  }, "\u2601\uFE0F \u30AF\u30E9\u30A6\u30C9\u540C\u671F\uFF08\u4ED6PC\u3068\u30C7\u30FC\u30BF\u5171\u6709\uFF09"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-[#334155] mb-2"
+  }, "OneDrive\u30D5\u30A9\u30EB\u30C0\u3092\u9078\u629E\u3059\u308B\u3068\u3001\u4ED6\u306EPC\u3068\u30C7\u30FC\u30BF\u304C\u81EA\u52D5\u540C\u671F\u3055\u308C\u307E\u3059"), /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 flex-wrap items-center"
+  }, !syncConnected ? /*#__PURE__*/React.createElement("button", {
+    onClick: onCloudConnect,
+    className: "px-4 py-2 bg-[#7c3aed] text-white rounded-lg text-sm hover:bg-[#6d28d9] btn-hover"
+  }, "\u540C\u671F\u30D5\u30A9\u30EB\u30C0\u3092\u63A5\u7D9A") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
+    className: "text-xs text-[#059669] font-medium"
+  }, "\u2705 \u63A5\u7D9A\u4E2D"), /*#__PURE__*/React.createElement("button", {
+    onClick: onCloudSave,
+    className: "px-4 py-2 bg-[#7c3aed] text-white rounded-lg text-sm hover:bg-[#6d28d9] btn-hover"
+  }, "\u30AF\u30E9\u30A6\u30C9\u306B\u4FDD\u5B58"), /*#__PURE__*/React.createElement("button", {
+    onClick: onCloudLoad,
+    className: "px-4 py-2 bg-[#f1f5f9] text-[#020617] rounded-lg text-sm hover:bg-[#e2e8f0] btn-hover"
+  }, "\u30AF\u30E9\u30A6\u30C9\u304B\u3089\u5FA9\u5143"))), (() => {
+    const lastSync = CloudSync.getLastSync();
+    return lastSync ? /*#__PURE__*/React.createElement("p", {
+      className: "text-xs text-[#64748b] mt-1"
+    }, "\u6700\u7D42\u540C\u671F: ", new Date(lastSync).toLocaleString('ja-JP')) : null;
+  })()), /*#__PURE__*/React.createElement("div", {
     className: "border-t pt-4"
   }, /*#__PURE__*/React.createElement("label", {
     className: "text-sm font-medium text-[#020617] block mb-2"
